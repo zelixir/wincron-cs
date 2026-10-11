@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- WinCron: dark rounded square, clock face, running dot -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#0f172a"/>
+  <circle cx="128" cy="124" r="84" fill="none" stroke="#e2e8f0" stroke-width="14"/>
+  <rect x="121" y="46" width="14" height="24" rx="7" fill="#e2e8f0"/>
+  <rect x="121" y="178" width="14" height="24" rx="7" fill="#e2e8f0"/>
+  <rect x="50" y="117" width="24" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="182" y="117" width="24" height="14" rx="7" fill="#e2e8f0"/>
+  <!-- minute hand → 1-2 o'clock, hour hand → 9-10 o'clock -->
+  <line x1="128" y1="124" x2="128" y2="66" stroke="#f8fafc" stroke-width="13" stroke-linecap="round" transform="rotate(40 128 124)"/>
+  <line x1="128" y1="124" x2="128" y2="84" stroke="#f8fafc" stroke-width="13" stroke-linecap="round" transform="rotate(-70 128 124)"/>
+  <circle cx="128" cy="124" r="11" fill="#38bdf8"/>
+  <!-- live indicator -->
+  <circle cx="196" cy="196" r="22" fill="#22c55e" stroke="#0f172a" stroke-width="8"/>
+</svg>
