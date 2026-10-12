@@ -90,10 +90,13 @@ CREATE INDEX IF NOT EXISTS idx_job_logs_job_id_started_at ON job_logs(job_id, st
 - cron 解析：Cronos `CronExpression.Parse(expr, CronFormat.StandardFlags)`；5 段标准式。`Trim()` 后等于 `@reboot` → 视为开机任务（RunAtStartup=true，不参与 cron 调度）。解析失败的任务不调度、app.log 记 error，不影响其他任务。
 - 调度器：每任务一个 `System.Threading.Timer`，dueTime = `CronExpression.GetNextOccurrence(DateTime.Now, TimeZoneInfo.Local) - now`；触发后立即重算下次。到点后 `Task.Run` 执行（不占定时器线程）。全局/任务禁用时销毁定时器，启用时重建。
 - 睡眠唤醒：定时器到点已过期会立即触发（.NET 默认），即补跑一次唤醒后错过的点，不做补扫队列——与旧版一致。
+- **开机补跑（2026-10-12 新增，用户明确需要）**：进程启动 Initialize 时，对每个**启用且 cron 可解析**（非 @reboot）的任务：取"最近应触发时刻 T_last = now 之前最近的 cron 发生点（仅回看 24 小时内）"；若 `LastExecutedAt` 可解析且 `T_last > LastExecutedAt` → **异步补跑一轮（trigger=cron）**。细则：`LastExecutedAt` 为空（从未跑过）**不**补跑（避免新任务启动即执行）；T_last 超过 24 小时不补（远期错过不追）；补跑走正常执行链（并发策略/计数/落库照旧），LastExecutedAt 更新后重启不会重复补。睡眠唤醒与开机补跑互补不重叠：进程活着靠定时器，进程新建靠本规则。
 - 执行（对齐 Go 版 `execute()`）：
   - `ProcessStartInfo`：`UseShellExecute=false`；`FileName=Command`；`ArgumentList.AddRange(Args)`；`WorkingDirectory=WorkDir 或数据目录`；环境变量默认继承（`EnvironmentVariables` 不动）；`CreateNoWindow = (FlagProcessCreation=="CREATE_NO_WINDOW")`。
   - stdout/stderr 重定向捕获，UTF-8。
-  - `Timeout>0`：到点 `Process.Kill()`（只杀进程本身，与旧版一致），`ExitCode=-1`，`Error="timeout after <N>s"`。
+  - `Timeout>0`：到点**杀整棵进程树**（`taskkill /PID <pid> /T /F` 兜底 `Process.Kill()`；包装脚本会派生子进程，只杀父进程会留下持管道的孤儿），`ExitCode=-1`，`Error="timeout after <N>s"`。
+  - **读管道防挂起**：进程句柄退出后，等待 stdout/stderr 读任务完成**最多再等 5 秒**，超时即放弃（取已读内容），绝不无限等待——子进程树残留持有管道时不能卡死整个执行流程。
+  - **运行账本一致性（BUG 修复，2026-10-12）**：运行中实例的登记/注销必须收口在**一处**（CronService 的 `_running`），登记后无论正常结束、超时、异常，**必须注销**（try/finally 兜底）；执行链上不允许出现第二本账（SqliteLogStore 的 TrackRunning/UntrackRunning 删除，运行中条目统一从 `_running` 合并进 logs 查询）。漏删的直接后果：skip 策略任务首轮之后永久 "already running"，cron 触发静默跳过、任务静默死亡。
   - 正常等待结束：退出码取 `Process.ExitCode`；若 `Win32Exception`/启动失败 → `ExitCode=-1`，`Error=异常消息`。
   - 结束后入库一条日志、更新计数：`ExecutedCount++`、`LastExecutedAt=FinishedAt`；成功 → `ConsecutiveFailures=0`；失败 → `++`；若 `Enabled && MaxConsecutiveFailures>0 && ConsecutiveFailures>=Max` → 自动 `Enabled=false`（app.log 记 warning）。随后持久化 jobs.json。
 - 并发策略（对齐 Go）：

@@ -1,11 +1,11 @@
-using System.Collections.Concurrent;
 using Microsoft.Data.Sqlite;
 
 namespace WinCron.Core;
 
 /// <summary>
 /// logs.sqlite 访问（与旧版同结构，SPEC §4）。打开失败重试 3 次后退化为 :memory:。
-/// 运行中的条目仅在内存里（TrackRunning/UntrackRunning），结束时插入一条。
+/// 只在任务结束时插入一条；运行中条目不落库、也不在本类记账——由唯一账本
+/// CronService._running 提供并经 Query 合并（SPEC §5 运行账本一致性）。
 /// </summary>
 public sealed class SqliteLogStore : IDisposable
 {
@@ -33,7 +33,6 @@ public sealed class SqliteLogStore : IDisposable
 
     private readonly string _path;
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private readonly ConcurrentDictionary<string, JobLogEntry> _running = new();
     private SqliteConnection? _conn;
     private bool _memoryFallback;
 
@@ -122,12 +121,6 @@ public sealed class SqliteLogStore : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    // ---- 运行中条目（仅内存） ----
-
-    public void TrackRunning(JobLogEntry entry) => _running[entry.Id] = entry;
-
-    public void UntrackRunning(string entryId) => _running.TryRemove(entryId, out _);
-
     // ---- 结束条目入库 ----
 
     public void InsertFinished(JobLogEntry entry)
@@ -174,9 +167,11 @@ public sealed class SqliteLogStore : IDisposable
     }
 
     /// <summary>
-    /// tail 查询（新的在前），合并运行中的内存条目。jobId/jobName 均为 null 时查全部。
+    /// tail 查询（新的在前），合并调用方传入的运行中内存条目（来自唯一账本 CronService._running）。
+    /// jobId/jobName 均为 null 时查全部。运行中条目与已入库条目按 Id 去重（结束收尾的两步之间存在重叠窗口）。
     /// </summary>
-    public List<JobLogEntry> Query(string? jobId, string? jobName, int limit)
+    public List<JobLogEntry> Query(
+        string? jobId, string? jobName, int limit, IReadOnlyCollection<JobLogEntry> runningEntries)
     {
         if (limit <= 0)
         {
@@ -184,6 +179,7 @@ public sealed class SqliteLogStore : IDisposable
         }
 
         var result = new List<JobLogEntry>();
+        var seenIds = new HashSet<string>(StringComparer.Ordinal);
         if (_conn != null)
         {
             try
@@ -214,9 +210,11 @@ public sealed class SqliteLogStore : IDisposable
                     using var reader = cmd.ExecuteReader();
                     while (reader.Read())
                     {
+                        var id = reader.GetString(0);
+                        seenIds.Add(id);
                         result.Add(new JobLogEntry
                         {
-                            Id = reader.GetString(0),
+                            Id = id,
                             JobId = reader.GetString(1),
                             JobName = reader.GetString(2),
                             TriggerSource = reader.GetString(3),
@@ -242,12 +240,12 @@ public sealed class SqliteLogStore : IDisposable
             }
         }
 
-        foreach (var r in _running.Values)
+        foreach (var r in runningEntries)
         {
             var match = (jobId == null && jobName == null)
                         || (jobId != null && string.Equals(r.JobId, jobId, StringComparison.Ordinal))
                         || (jobName != null && string.Equals(r.JobName, jobName, StringComparison.Ordinal));
-            if (match)
+            if (match && seenIds.Add(r.Id))
             {
                 result.Add(r);
             }

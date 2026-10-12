@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using Cronos;
 
 namespace WinCron.Core;
@@ -80,6 +81,8 @@ public sealed class CronService : IDisposable
 
         // SPEC §5 启动顺序：加载 jobs.json → 启用且 RunAtStartup 的任务异步执行一轮 → 其余建定时器
         RunStartupJobs();
+        // 开机补跑（SPEC §5，2026-10-12 新增）：仅在 Initialize 时做，ReloadJobsFromDisk 不触发
+        RunMissedOccurrenceCatchUp();
         RebuildTimers();
     }
 
@@ -349,7 +352,7 @@ public sealed class CronService : IDisposable
                         {
                             if (_processes.TryGetValue(r.Id, out var p))
                             {
-                                try { p.Kill(); } catch { }
+                                try { Executor.KillTree(p); } catch { }
                             }
                         }
 
@@ -376,8 +379,10 @@ public sealed class CronService : IDisposable
                 StartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 Running = true,
             };
+
+            // 唯一登记处（SPEC §5 运行账本一致性）：运行中实例只记在 CronService._running，
+            // 注销由 ExecuteCoreAsync 的 try/finally 兜底。
             _running[entry.Id] = entry;
-            _logStore.TrackRunning(entry);
         }
 
         AppLog.Info($"job '{job.Name}' started (trigger={trigger})");
@@ -399,6 +404,21 @@ public sealed class CronService : IDisposable
     }
 
     private async Task ExecuteCoreAsync(Job job, JobLogEntry entry)
+    {
+        try
+        {
+            await RunJobToCompletionAsync(job, entry);
+        }
+        finally
+        {
+            // _running 的唯一注销点（SPEC §5 运行账本一致性）：
+            // 正常结束 / 超时 / 启动或收尾异常，所有路径都必须移除，
+            // 否则 skip 策略任务会永久 "already running"、cron 触发静默跳过。
+            _running.TryRemove(entry.Id, out _);
+        }
+    }
+
+    private async Task RunJobToCompletionAsync(Job job, JobLogEntry entry)
     {
         ExecResult result;
         try
@@ -432,7 +452,6 @@ public sealed class CronService : IDisposable
         entry.Stderr = result.Stderr ?? "";
         entry.Error = result.Error ?? "";
         entry.FinishedAt = result.FinishedAt;
-        _logStore.UntrackRunning(entry.Id);
         _logStore.InsertFinished(entry);
 
         var elapsedMs = Math.Max(0, entry.FinishedAt - entry.StartedAt);
@@ -507,7 +526,8 @@ public sealed class CronService : IDisposable
             }
         }
 
-        return _logStore.Query(jobId, jobName, n);
+        // 运行中条目来自唯一账本 _running（SPEC §5 运行账本一致性），由 Query 合并去重
+        return _logStore.Query(jobId, jobName, n, _running.Values.ToList());
     }
 
     /// <summary>jobNameOrId 为空 → 清空全部日志。</summary>
@@ -587,6 +607,126 @@ public sealed class CronService : IDisposable
                 }
             });
         }
+    }
+
+    /// <summary>
+    /// 开机补跑（SPEC §5，2026-10-12 新增）。仅在进程启动 Initialize 时调用一次，
+    /// ReloadJobsFromDisk（运行中重载）不得触发。
+    /// 对每个启用且 cron 可解析（非 @reboot）的任务：取最近 24 小时内 now 之前最近的
+    /// cron 发生点 T_last；若 LastExecutedAt 可解析且 T_last &gt; LastExecutedAt → 异步补跑一轮
+    /// （trigger=cron，走正常执行链：并发策略/计数/落库照旧）。
+    /// 细则：LastExecutedAt 为空/不可解析（从未跑过）不补；T_last 超出 24 小时窗口不补；
+    /// RunAtStartup 任务由 RunStartupJobs 负责启动（调度器本就不为它们建 cron 定时器），不在补跑之列。
+    /// </summary>
+    private void RunMissedOccurrenceCatchUp()
+    {
+        if (_degraded)
+        {
+            AppLog.Info("catch-up skipped: data directory unavailable (scheduling disabled)");
+            return;
+        }
+
+        if (!_state.GlobalEnabled)
+        {
+            // 与 cron 定时器语义一致：全局暂停时不触发（含补跑）
+            AppLog.Info("catch-up skipped: global scheduling is paused");
+            return;
+        }
+
+        List<Job> snapshot;
+        lock (_lock)
+        {
+            snapshot = _jobs.Where(j => j.Enabled && !IsStartupJob(j)).ToList();
+        }
+
+        var nowUtc = DateTime.UtcNow;
+        var catchUpCount = 0;
+        foreach (var job in snapshot)
+        {
+            var expr = CronUtil.TryParse(job.Cron);
+            if (expr == null)
+            {
+                continue; // cron 不可解析（含 @reboot）：调度侧已记 error，不补跑
+            }
+
+            var tLast = GetLastOccurrenceWithin24h(expr, nowUtc);
+            if (tLast == null)
+            {
+                continue; // 24 小时窗口内没有发生点
+            }
+
+            var lastExecuted = ParseRfc3339Offset(job.LastExecutedAt);
+            if (lastExecuted == null)
+            {
+                continue; // LastExecutedAt 为空/不可解析（从未跑过）不补，避免新任务启动即执行
+            }
+
+            if (tLast.Value <= lastExecuted.Value)
+            {
+                continue; // 该发生点之后已执行过，重启不重复补
+            }
+
+            catchUpCount++;
+            AppLog.Info(
+                $"catch-up: job '{job.Name}' missed cron occurrence {tLast.Value.ToLocalTime():yyyy-MM-dd'T'HH:mm:sszzz}"
+                + $" (last executed {job.LastExecutedAt}); running now");
+
+            var j = job;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    StartJob(j, TriggerSources.Cron);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error($"catch-up run of '{j.Name}' failed: {ex.Message}");
+                }
+            });
+        }
+
+        if (catchUpCount > 0)
+        {
+            AppLog.Info($"catch-up scheduled for {catchUpCount} job(s)");
+        }
+    }
+
+    /// <summary>
+    /// 最近 24 小时内 now 之前最近的 cron 发生点（UTC；含窗口起点、不含 now 本身——
+    /// now 上的发生点由定时器 dueTime≤0 立即触发覆盖）。Cronos 0.8.4 无 GetPreviousOccurrence，
+    /// 用 GetOccurrences 做有界区间查询：5 段式最小粒度为分钟，24h 至多约 1440 个点（DST 回拨再多一小时）。
+    /// </summary>
+    private static DateTime? GetLastOccurrenceWithin24h(CronExpression expr, DateTime nowUtc)
+    {
+        DateTime? last = null;
+        try
+        {
+            foreach (var occurrence in expr.GetOccurrences(
+                nowUtc.AddDays(-1), nowUtc, TimeZoneInfo.Local, fromInclusive: true, toInclusive: false))
+            {
+                last = occurrence;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error($"catch-up: computing last occurrence failed: {ex.Message}");
+            return null;
+        }
+
+        return last;
+    }
+
+    /// <summary>解析 LastExecutedAt（RFC3339 带本地偏移，空串 = 未跑过）；失败返回 null。</summary>
+    private static DateTimeOffset? ParseRfc3339Offset(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s))
+        {
+            return null;
+        }
+
+        return DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var v)
+            ? v
+            : null;
     }
 
     private void RebuildTimers()
